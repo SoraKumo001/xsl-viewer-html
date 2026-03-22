@@ -1,0 +1,625 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <title>XSL Viewer</title>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    html,
+    body {
+      min-height: 100%;
+      min-width: 100%;
+      margin: 0;
+      font-family: sans-serif;
+    }
+
+    h1 {
+      font-size: 20px;
+      font-weight: normal;
+      border-radius: 4px;
+      background-color: #eeeeee;
+      padding: 4px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .container {
+      padding: 0 12px;
+    }
+
+    .container-list {
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    .container-list>*+* {
+      border-top: 1px solid #e5e7eb;
+    }
+
+    iframe {
+      min-width: 1122px;
+      border: none;
+      display: block;
+      margin: auto;
+    }
+
+    .drop-zone {
+      height: 100vh;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+    }
+
+    .drop-message {
+      padding: 16px;
+      font-size: 2em;
+      border: 2px dashed #000;
+      border-radius: 16px;
+      color: #333;
+      user-select: none;
+    }
+
+    .btn {
+      padding: 4px 12px;
+      font-size: 14px;
+      cursor: pointer;
+      background-color: #007bff;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      text-decoration: none;
+    }
+
+    .btn:hover {
+      background-color: #0056b3;
+    }
+
+    .btn:disabled {
+      background-color: #ccc;
+      cursor: not-allowed;
+    }
+
+    .global-actions {
+      position: sticky;
+      top: 0;
+      background: white;
+      padding: 8px 12px;
+      border-bottom: 1px solid #ddd;
+      display: flex;
+      gap: 16px;
+      align-items: center;
+      z-index: 100;
+      box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+    }
+
+    .settings {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 14px;
+    }
+
+    .settings label {
+      white-space: nowrap;
+    }
+
+    .settings input {
+      width: 60px;
+      padding: 2px 4px;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+    }
+
+    @media print {
+      .container-list>*+* {
+        border-top: none;
+      }
+
+      .container {
+        padding: 0;
+      }
+
+      .container>h1 {
+        display: none;
+      }
+
+      .drop-zone {
+        display: none;
+      }
+
+      .global-actions {
+        display: none;
+      }
+    }
+  </style>
+  <script type="importmap">
+    {
+      "imports": {
+        "satoru-render": "https://unpkg.com/satoru-render/dist/single.js",
+        "satoru-render/index": "https://unpkg.com/satoru-render/dist/index.js",
+        "satoru-render/satoru.js": "https://unpkg.com/satoru-render/dist/satoru.js"
+      }
+    }
+  </script>
+  <script>
+    /**
+     * Utilities for handling ZIP files.
+     * @namespace
+     */
+    const ZipUtils = {
+      /**
+       * Decompresses raw deflate data.
+       * @param {ArrayBuffer} compressedData - The compressed data.
+       * @returns {Promise<Blob>} The decompressed data as a Blob.
+       */
+      async decompressData(compressedData) {
+        const stream = new Blob([compressedData])
+          .stream()
+          .pipeThrough(new DecompressionStream("deflate-raw"));
+        return new Response(stream).blob();
+      },
+
+      /**
+       * Parses a ZIP file ArrayBuffer and extracts files.
+       * @param {ArrayBuffer} arrayBuffer - The raw ZIP file data.
+       * @returns {Promise<File[]>} An array of extracted File objects.
+       */
+      async parse(arrayBuffer) {
+        const dataView = new DataView(arrayBuffer);
+        let offset = 0;
+        const files = [];
+        const decoderUtf8 = new TextDecoder("utf-8");
+        const decoderSjis = new TextDecoder("shift-jis");
+
+        while (offset < dataView.byteLength) {
+          const signature = dataView.getUint32(offset, true);
+          if (signature !== 0x04034b50) break;
+
+          const generalPurposeFlag = dataView.getUint16(offset + 6, true);
+          const fileNameLength = dataView.getUint16(offset + 26, true);
+          const extraFieldLength = dataView.getUint16(offset + 28, true);
+          let compressedSize = dataView.getUint32(offset + 18, true);
+
+          const isUtf8 = (generalPurposeFlag & 0x0800) !== 0;
+          const fileNameBuffer = arrayBuffer.slice(offset + 30, offset + 30 + fileNameLength);
+          const pathName = (isUtf8 ? decoderUtf8 : decoderSjis).decode(fileNameBuffer);
+
+          offset += 30 + fileNameLength + extraFieldLength;
+          const dataOffset = offset;
+
+          const isDataDescriptor = (generalPurposeFlag & 0x0008) !== 0;
+          if (isDataDescriptor) {
+            while (offset < dataView.byteLength) {
+              if (dataView.getUint32(offset, true) === 0x08074b50) {
+                compressedSize = dataView.getUint32(offset + 8, true);
+                offset += 16;
+                break;
+              }
+              offset++;
+            }
+          } else {
+            offset += compressedSize;
+          }
+
+          if (!pathName.endsWith("/")) {
+            const compressedData = arrayBuffer.slice(dataOffset, dataOffset + compressedSize);
+            const blob = await this.decompressData(compressedData);
+            const fileName = pathName.split('/').pop();
+            files.push(new File([blob], fileName));
+          }
+        }
+        return files;
+      },
+
+      /**
+       * Unzips an array of files, handling both ZIP archives and regular files.
+       * @param {File[]} sourceFiles - The list of dropped files.
+       * @returns {Promise<File[]>} A flattened array of all files (extracted and original).
+       */
+      async unzipFiles(sourceFiles) {
+        const nestedFiles = await Promise.all(
+          sourceFiles.map(async (file) => {
+            if (this.isZip(file)) {
+              return this.parse(await file.arrayBuffer());
+            }
+            return file;
+          })
+        );
+        return nestedFiles.flat();
+      },
+
+      /**
+       * Checks if a file is a ZIP archive.
+       * @param {File} file - The file to check.
+       * @returns {boolean} True if the file is a ZIP.
+       */
+      isZip(file) {
+        return (
+          file.type.match(/^application\/(x-zip-compressed|zip)$/) ||
+          file.name.match(/\.zip$/i)
+        );
+      }
+    };
+
+    /**
+     * Handles XSLT transformations.
+     * @namespace
+     */
+    const XslTransformer = {
+      /**
+       * Transforms XML files using XSLT.
+       * @param {File[]} allFiles - All available files (for resolving references).
+       * @param {string|null} [targetName=null] - Optional specific file name to transform.
+       * @returns {Promise<[string, string][]>} An array of [filename, transformedHTML] pairs.
+       */
+      async transform(allFiles, targetName = null) {
+        const fileMap = await this.createFileMap(allFiles);
+        let xmlFiles = allFiles.filter((f) => f.name.match(/\.xml$/i));
+
+        if (targetName) {
+          xmlFiles = xmlFiles.filter((f) => f.name === targetName);
+        }
+
+        return Promise.all(xmlFiles.map((file) => this.processXmlFile(file, fileMap)));
+      },
+
+      /**
+       * Creates a map of filenames to parsed XML Documents.
+       * @param {File[]} files - The list of files.
+       * @returns {Promise<Object<string, Document>>} A map of filename -> XML Document.
+       */
+      async createFileMap(files) {
+        const parser = new DOMParser();
+        const entries = await Promise.all(
+          files
+            .filter((f) => f.name.match(/\.xml$|\.xsl$/i))
+            .map(async (f) => {
+              const text = await f.text();
+              const doc = parser.parseFromString(text, "application/xml");
+              return [f.name, doc];
+            })
+        );
+        return Object.fromEntries(entries);
+      },
+
+      /**
+       * Processes a single XML file, applying XSLT.
+       * @param {File} file - The XML file to process.
+       * @param {Object<string, Document>} fileMap - Map of available XML/XSL documents.
+       * @returns {[string, string]} The filename and the transformed HTML string.
+       */
+      processXmlFile(file, fileMap) {
+        const xmlDoc = fileMap[file.name];
+        const xsltProcessor = new XSLTProcessor();
+
+        this.importStylesheets(xmlDoc, fileMap, xsltProcessor);
+
+        const resultDoc = xsltProcessor.transformToDocument(xmlDoc);
+        const serializer = new XMLSerializer();
+        return [file.name, serializer.serializeToString(resultDoc)];
+      },
+
+      /**
+       * Imports linked XSL stylesheets into the processor.
+       * @param {Document} xmlDoc - The source XML document.
+       * @param {Object<string, Document>} fileMap - Map of available documents.
+       * @param {XSLTProcessor} xsltProcessor - The processor instance.
+       */
+      importStylesheets(xmlDoc, fileMap, xsltProcessor) {
+        const styleNodes = Array.from(xmlDoc.childNodes).filter(
+          (node) =>
+            node.nodeType === Node.PROCESSING_INSTRUCTION_NODE &&
+            node.target === "xml-stylesheet"
+        );
+
+        styleNodes.forEach((node) => {
+          const hrefMatch = node.data.match(/href="([^"]+)"/);
+          if (hrefMatch) {
+            const xslDoc = fileMap[hrefMatch[1]];
+            if (xslDoc) xsltProcessor.importStylesheet(xslDoc);
+          }
+        });
+      }
+    };
+
+    /**
+     * Manages the Viewer UI and interactions.
+     * @namespace
+     */
+    const Viewer = {
+      /** @type {File[]} List of currently loaded files. */
+      allFiles: [],
+      /** @type {[string, string][]} List of transformed documents. */
+      docs: [],
+      /** @type {any} Satoru worker instance. */
+      satoru: null,
+      /** @type {number} PDF output width. */
+      pdfWidth: 1500,
+      /** @type {number} PDF output padding. */
+      pdfPadding: 64,
+
+      /**
+       * Initializes the viewer by attaching global event listeners.
+       */
+      init() {
+        document.body.addEventListener("dragover", (e) => e.preventDefault());
+        document.body.addEventListener("drop", (e) => this.handleDrop(e));
+      },
+
+      /**
+       * Handles the file drop event.
+       * @param {DragEvent} e - The drop event.
+       */
+      async handleDrop(e) {
+        e.preventDefault();
+        const files = Array.from(e.dataTransfer.files);
+        if (files.length === 0) return;
+
+        this.allFiles = await ZipUtils.unzipFiles(files);
+        const docs = await XslTransformer.transform(this.allFiles);
+
+        this.docs = docs;
+        this.renderDocs(docs, false);
+      },
+
+      /**
+       * Renders the transformed documents into the DOM.
+       * @param {[string, string][]} docs - Array of [filename, content] pairs.
+       * @param {boolean} [shouldScroll=true] - Whether to scroll the new content into view.
+       */
+      renderDocs(docs, shouldScroll = true) {
+        // Clear existing content if it's the initial drop
+        if (!shouldScroll) {
+          document.body.innerHTML = "";
+          this.addGlobalActions();
+        }
+
+        let containerList = document.querySelector(".container-list");
+        if (!containerList) {
+          containerList = document.createElement("div");
+          containerList.className = "container-list";
+          document.body.appendChild(containerList);
+        }
+
+        docs.forEach(([name, content]) => {
+          const container = this.createDocContainer(name, content);
+          containerList.appendChild(container);
+          if (shouldScroll) {
+            container.scrollIntoView({ behavior: "smooth" });
+          }
+        });
+      },
+
+      /**
+       * Adds global action buttons and settings.
+       */
+      addGlobalActions() {
+        const div = document.createElement("div");
+        div.className = "global-actions";
+
+        // Settings
+        const settingsDiv = document.createElement("div");
+        settingsDiv.className = "settings";
+
+        const widthLabel = document.createElement("label");
+        widthLabel.innerText = "PDF Width:";
+        const widthInput = document.createElement("input");
+        widthInput.type = "number";
+        widthInput.value = this.pdfWidth;
+        widthInput.oninput = (e) => this.pdfWidth = parseInt(e.target.value) || 0;
+
+        const paddingLabel = document.createElement("label");
+        paddingLabel.innerText = "Padding:";
+        const paddingInput = document.createElement("input");
+        paddingInput.type = "number";
+        paddingInput.value = this.pdfPadding;
+        paddingInput.oninput = (e) => this.pdfPadding = parseInt(e.target.value) || 0;
+
+        settingsDiv.append(widthLabel, widthInput, paddingLabel, paddingInput);
+        div.appendChild(settingsDiv);
+
+        const pdfBtn = document.createElement("button");
+        pdfBtn.className = "btn";
+        pdfBtn.innerText = "All PDF";
+        pdfBtn.onclick = () => this.exportPdf(this.docs, "all-documents.pdf", pdfBtn);
+
+        div.appendChild(pdfBtn);
+        document.body.appendChild(div);
+      },
+
+      /**
+       * Creates a container element for a document.
+       * @param {string} name - The document name.
+       * @param {string} content - The HTML content.
+       * @returns {HTMLDivElement} The created container element.
+       */
+      createDocContainer(name, content) {
+        const div = document.createElement("div");
+        div.className = "container";
+
+        const header = document.createElement("h1");
+        const titleSpan = document.createElement("span");
+        titleSpan.innerText = name;
+
+        const pdfBtn = document.createElement("button");
+        pdfBtn.className = "btn";
+        pdfBtn.innerText = "PDF";
+        pdfBtn.onclick = () => this.exportPdf([[name, content]], `${name.replace(/\.xml$/i, "")}.pdf`, pdfBtn);
+
+        header.append(titleSpan, pdfBtn);
+
+        const iframe = document.createElement("iframe");
+
+        div.append(header, iframe);
+
+        // Wait for append to access contentWindow
+        requestAnimationFrame(() => {
+          this.writeIframeContent(iframe, content);
+          this.setupIframeResize(iframe);
+          this.attachLinkHandler(iframe);
+        });
+
+        return div;
+      },
+
+      /**
+       * Writes content and styles into the iframe.
+       * @param {HTMLIFrameElement} iframe - The iframe element.
+       * @param {string} content - The HTML content to write.
+       */
+      writeIframeContent(iframe, content) {
+        const doc = iframe.contentWindow.document;
+        doc.open();
+        doc.write(content);
+
+        const style = doc.createElement("style");
+        style.textContent = `
+          body > div { white-space: normal; }
+          pre.oshirase { text-wrap-mode: wrap; }
+          pre.normal { text-wrap: auto; }
+          @media print {
+            body::-webkit-scrollbar { display: none; }
+          }
+        `;
+        doc.head.appendChild(style);
+
+        const base = doc.createElement("base");
+        base.target = "_blank";
+        doc.head.appendChild(base);
+
+        doc.close();
+      },
+
+      /**
+       * Configures auto-resizing for the iframe.
+       * @param {HTMLIFrameElement} iframe - The iframe element.
+       */
+      setupIframeResize(iframe) {
+        const resize = () => {
+          const docEl = iframe.contentWindow.document.documentElement;
+          iframe.style.height = docEl.scrollHeight + "px";
+          iframe.style.width = docEl.scrollWidth + "px";
+        };
+        iframe.onload = resize;
+        resize();
+      },
+
+      /**
+       * Attaches a click handler to the iframe's document to intercept internal links.
+       * @param {HTMLIFrameElement} iframe - The iframe element.
+       */
+      attachLinkHandler(iframe) {
+        iframe.contentWindow.document.addEventListener("click", (e) =>
+          this.handleLinkClick(e)
+        );
+      },
+
+      /**
+       * Handles link clicks within the iframe.
+       * @param {Event} e - The click event.
+       */
+      handleLinkClick(e) {
+        const a = e.target.closest("a");
+        if (!a || !a.getAttribute("href")) return;
+
+        const href = a.getAttribute("href");
+        if (href.match(/^(https?:|mailto:|tel:)/)) return;
+
+        const decodedHref = decodeURIComponent(href);
+        const targetFileName = decodedHref.split('/').pop();
+
+        // Check for existing document in view
+        const existing = Array.from(document.querySelectorAll("h1")).find(
+          (h) => h.querySelector("span").innerText === targetFileName
+        );
+        if (existing) {
+          e.preventDefault();
+          existing.parentElement.scrollIntoView({ behavior: "smooth" });
+          return;
+        }
+
+        const targetFile = this.allFiles.find((f) => f.name === targetFileName);
+        if (targetFile) {
+          e.preventDefault();
+          this.processInternalLink(targetFile);
+        }
+      },
+
+      /**
+       * Processes an internal link click (either transform XML or download file).
+       * @param {File} file - The target file.
+       */
+      async processInternalLink(file) {
+        if (file.name.match(/\.xml$/i)) {
+          const newDocs = await XslTransformer.transform(this.allFiles, file.name);
+          this.docs.push(...newDocs);
+          this.renderDocs(newDocs, true);
+        } else {
+          this.downloadFile(file);
+        }
+      },
+
+      /**
+       * Triggers a file download.
+       * @param {File} file - The file to download.
+       */
+      downloadFile(file) {
+        const url = URL.createObjectURL(file);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = file.name;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(url), 100);
+      },
+
+      /**
+       * Exports documents to PDF.
+       * @param {[string, string][]} docs - Array of [name, content]
+       * @param {string} fileName - Output file name.
+       * @param {HTMLButtonElement} btn - The button triggered the export.
+       */
+      async exportPdf(docs, fileName, btn) {
+        const originalText = btn.innerText;
+        btn.disabled = true;
+        btn.innerText = "Rendering...";
+
+        try {
+          // Worker を使わない single 版をインポート
+          const { render } = await import("satoru-render");
+          const pdf = await render({
+            value: docs.map(v => v[1]),
+            format: "pdf",
+            width: this.pdfWidth,
+            css: `html{padding:${this.pdfPadding}px;}`
+          });
+
+          const blob = new Blob([pdf], { type: "application/pdf" });
+          const url = URL.createObjectURL(blob);
+          window.open(url, "_blank");
+        } catch (err) {
+          console.error("PDF generation failed:", err);
+          alert("PDF generation failed.");
+        } finally {
+          btn.disabled = false;
+          btn.innerText = originalText;
+        }
+      }
+    };
+  </script>
+</head>
+
+<body>
+  <div class="drop-zone">
+    <span class="drop-message">
+      Drop files or zip-file here
+    </span>
+  </div>
+  <script>
+    Viewer.init();
+  </script>
+</body>
+
+</html>
