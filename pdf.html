@@ -135,15 +135,6 @@
       }
     }
   </style>
-  <script type="importmap">
-    {
-      "imports": {
-        "satoru-render": "https://unpkg.com/satoru-render/dist/single.js",
-        "satoru-render/index": "https://unpkg.com/satoru-render/dist/index.js",
-        "satoru-render/satoru.js": "https://unpkg.com/satoru-render/dist/satoru.js"
-      }
-    }
-  </script>
   <script>
     /**
      * Utilities for handling ZIP files.
@@ -587,8 +578,7 @@
         btn.innerText = "Rendering...";
 
         try {
-          // Worker を使わない single 版をインポート
-          const { render } = await import("satoru-render");
+          const { render } = await import("https://esm.sh/satoru-render");
           const pdf = await render({
             value: docs.map(v => v[1]),
             format: "pdf",
